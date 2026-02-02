@@ -181,6 +181,10 @@ class InteractiveVideoBuilderWithAI:
         self.config = None
         self.grounding_set = False
         
+        # Warm-up tracking for back/goto operations
+        self.needs_warmup = False
+        self.warmup_prompt = None
+        
         # Session info
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.session_dir = os.path.join(output_dir, f"session_{self.session_id}")
@@ -351,11 +355,99 @@ class InteractiveVideoBuilderWithAI:
             blk["v"].zero_()
             blk["is_init"] = False
     
-    def generate_chunk(self, chunk_idx: int, user_prompt: str, processed_prompt: str) -> float:
+    def _run_dummy_generation(self, chunk_idx: int, prompt: str):
+        """Run a dummy generation pass to reset model context (output discarded)"""
+        start_frame = chunk_idx * self.frames_per_chunk
+        end_frame = start_frame + self.frames_per_chunk
+        num_blocks = self.frames_per_chunk // self.pipeline.num_frame_per_block
+        
+        print(f"  [Warm-up pass] Resetting model context...")
+        
+        conditional_dict = self.pipeline.text_encoder(text_prompts=[prompt])
+        
+        # Initialize fresh cache
+        self._initialize_caches()
+        
+        # Recache with the previous prompt
+        if chunk_idx > 0:
+            self._recache_after_switch(start_frame, conditional_dict)
+        
+        local_attn_size = self.pipeline.local_attn_size if self.pipeline.local_attn_size != -1 else 12
+        recache_frames = min(local_attn_size, start_frame) if chunk_idx > 0 else 0
+        recache_offset = start_frame - recache_frames if chunk_idx > 0 else 0
+        
+        # Generate (but don't save) - this fills the cache with proper context
+        current_start_frame = start_frame
+        dummy_noise = torch.randn_like(self.base_noise[:, start_frame:end_frame])
+        
+        for block_idx in range(num_blocks):
+            current_num_frames = self.pipeline.num_frame_per_block
+            noisy_input = dummy_noise[:, block_idx * current_num_frames:(block_idx + 1) * current_num_frames]
+            
+            cache_frame = current_start_frame - recache_offset
+            cache_pos = cache_frame * self.pipeline.frame_seq_length
+            
+            for step_idx, current_timestep in enumerate(self.pipeline.denoising_step_list):
+                timestep = torch.ones([1, current_num_frames], device=self.device, dtype=torch.int64) * current_timestep
+                
+                _, denoised_pred = self.pipeline.generator(
+                    noisy_image_or_video=noisy_input,
+                    conditional_dict=conditional_dict,
+                    timestep=timestep,
+                    kv_cache=self.pipeline.kv_cache1,
+                    crossattn_cache=self.pipeline.crossattn_cache,
+                    current_start=cache_pos
+                )
+                
+                if step_idx < len(self.pipeline.denoising_step_list) - 1:
+                    next_timestep = self.pipeline.denoising_step_list[step_idx + 1]
+                    noisy_input = self.pipeline.scheduler.add_noise(
+                        denoised_pred.flatten(0, 1),
+                        torch.randn_like(denoised_pred.flatten(0, 1)),
+                        next_timestep * torch.ones([current_num_frames], device=self.device, dtype=torch.long)
+                    ).unflatten(0, denoised_pred.shape[:2])
+            
+            # Update cache with context (but don't save latents)
+            context_timestep = torch.ones([1, current_num_frames], device=self.device, dtype=torch.int64) * self.config.context_noise
+            self.pipeline.generator(
+                noisy_image_or_video=denoised_pred,
+                conditional_dict=conditional_dict,
+                timestep=context_timestep,
+                kv_cache=self.pipeline.kv_cache1,
+                crossattn_cache=self.pipeline.crossattn_cache,
+                current_start=cache_pos,
+            )
+            
+            current_start_frame += current_num_frames
+        
+        print(f"  [Warm-up complete] Cache reset with previous context")
+    
+    def generate_chunk(self, chunk_idx: int, user_prompt: str, processed_prompt: str, 
+                       needs_warmup: bool = False, warmup_prompt: str = None) -> float:
         """Generate a single chunk"""
         start_frame = chunk_idx * self.frames_per_chunk
         end_frame = start_frame + self.frames_per_chunk
         num_blocks = self.frames_per_chunk // self.pipeline.num_frame_per_block
+        
+        # Track whether we did warm-up (affects cache handling)
+        did_warmup = False
+        
+        # If coming back from a later chunk, do a warm-up pass first
+        if needs_warmup and warmup_prompt and chunk_idx > 0:
+            # Restore context for warm-up
+            if chunk_idx - 1 in self.states:
+                prev_state = self.states[chunk_idx - 1]
+                context_frames = prev_state.end_latent.shape[1]
+                self.full_latents[:, prev_state.current_frame - context_frames:prev_state.current_frame] = prev_state.end_latent
+            
+            self._run_dummy_generation(chunk_idx, warmup_prompt)
+            did_warmup = True
+            
+            # Re-restore context for real generation
+            if chunk_idx - 1 in self.states:
+                prev_state = self.states[chunk_idx - 1]
+                context_frames = prev_state.end_latent.shape[1]
+                self.full_latents[:, prev_state.current_frame - context_frames:prev_state.current_frame] = prev_state.end_latent
         
         print(f"  Generating frames {start_frame}-{end_frame}...")
         
@@ -373,16 +465,38 @@ class InteractiveVideoBuilderWithAI:
                 context_frames = prev_state.end_latent.shape[1]
                 self.full_latents[:, prev_state.current_frame - context_frames:prev_state.current_frame] = prev_state.end_latent
             
-            # CRITICAL: Zero the existing cache before recaching with new prompt
-            self._initialize_caches()
-            
-            # Now recache with the NEW prompt's conditioning
-            self._recache_after_switch(start_frame, conditional_dict)
-            recached = True
-            # After recaching 12 frames from position 0, the cache ends at position 12*seq_len
-            local_attn_size = self.pipeline.local_attn_size if self.pipeline.local_attn_size != -1 else 12
-            recache_frames = min(local_attn_size, start_frame)
-            recache_offset = start_frame - recache_frames  # This is where cache position 0 maps to
+            if did_warmup:
+                # After warm-up, the cache has context from chunk 1's continuation
+                # DON'T zero the self-attention KV cache - keep that context
+                # Only reset cross-attention cache to switch text conditioning
+                for blk in self.pipeline.crossattn_cache:
+                    blk["k"].zero_()
+                    blk["v"].zero_()
+                    blk["is_init"] = False
+                
+                # Reset cache position indices to generate from start of this chunk
+                # The warm-up filled cache up to end of chunk 2, but we want to 
+                # regenerate from start of chunk 2
+                local_attn_size = self.pipeline.local_attn_size if self.pipeline.local_attn_size != -1 else 12
+                recache_frames = min(local_attn_size, start_frame)
+                recache_offset = start_frame - recache_frames
+                
+                # Set cache indices to recache start position
+                recache_cache_pos = recache_frames * self.pipeline.frame_seq_length
+                for cache in self.pipeline.kv_cache1:
+                    cache["global_end_index"].fill_(recache_cache_pos)
+                    cache["local_end_index"].fill_(recache_cache_pos % (local_attn_size * self.pipeline.frame_seq_length))
+                
+                recached = True
+                # No recache needed - warm-up already established context
+            else:
+                # Normal case (no warmup): reinitialize caches and recache
+                self._initialize_caches()
+                self._recache_after_switch(start_frame, conditional_dict)
+                recached = True
+                local_attn_size = self.pipeline.local_attn_size if self.pipeline.local_attn_size != -1 else 12
+                recache_frames = min(local_attn_size, start_frame)
+                recache_offset = start_frame - recache_frames
         else:
             self._initialize_caches()
         
@@ -631,8 +745,17 @@ class InteractiveVideoBuilderWithAI:
         # Revert prompt enhancer history
         self.enhancer.revert_to(target_idx - 1 if target_idx > 0 else 0)
         
+        # Set warm-up flag - use previous chunk's prompt to reset model context
+        self.needs_warmup = True
+        if target_idx > 0 and target_idx - 1 in self.states:
+            # Use the previous chunk's processed prompt for warm-up
+            self.warmup_prompt = self.states[target_idx - 1].processed_prompt
+        else:
+            # For chunk 1, use the enhanced grounding
+            self.warmup_prompt = self.enhancer.grounding
+        
         self.current_chunk = target_idx
-        print(f"  Rewound to chunk {target_chunk}. Enter new prompt for this chunk.")
+        print(f"  Rewound to chunk {target_chunk}. Will run warm-up pass before generating.")
         return True
     
     def finalize(self):
@@ -743,8 +866,19 @@ class InteractiveVideoBuilderWithAI:
             processed_prompt = self.enhancer.enhance_prompt(user_input)
             print(f"  Enhanced: {processed_prompt[:100]}...")
             
-            # Generate the chunk
-            self.generate_chunk(self.current_chunk, user_input, processed_prompt)
+            # Generate the chunk (with warmup if coming back from later chunk)
+            self.generate_chunk(
+                self.current_chunk, 
+                user_input, 
+                processed_prompt,
+                needs_warmup=self.needs_warmup,
+                warmup_prompt=self.warmup_prompt
+            )
+            
+            # Reset warmup flags after use
+            self.needs_warmup = False
+            self.warmup_prompt = None
+            
             self.current_chunk += 1
         
         if self.current_chunk >= self.max_chunks:
