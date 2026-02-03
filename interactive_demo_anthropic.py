@@ -50,25 +50,37 @@ class ChunkState:
 class PromptEnhancer:
     """Uses Anthropic Claude to enhance prompts while maintaining grounding"""
     
-    SYSTEM_PROMPT = """You are a video prompt engineer specializing in creating detailed, visually descriptive prompts for AI video generation.
+    SYSTEM_PROMPT = """You are a video prompt engineer. Your job is to create CONCISE, EFFECTIVE prompts for AI video generation.
 
-Your task is to take a user's short prompt or change description and expand it into a detailed, cinematic video prompt while maintaining the grounding context.
+STRUCTURE (follow this exactly):
+1. GROUNDING: State the subject and current setting (1 short phrase)
+2. CHANGE: What is visually different/happening (specific details)
+3. MOTION: How things are moving in the scene (temporal description)
 
-Rules:
-1. ALWAYS include the grounding subject and setting in your output
-2. Add rich visual details: lighting, colors, textures, atmosphere
-3. Describe motion and action clearly but naturally
-4. Include camera perspective hints when relevant
-5. Keep the style consistent with the grounding
-6. Be concise but descriptive (2-4 sentences max)
-7. Use present tense, active descriptions
-8. Do NOT use quotes or special formatting
-9. Output ONLY the enhanced prompt, nothing else
+RULES:
+- BE CONCISE: Maximum 2 sentences total. Every word must serve a purpose.
+- NO FLUFF: Cut adjectives like "dramatic", "majestic", "beautiful" - they waste tokens
+- EXECUTE THE ACTION: User says "transforms" = describe transformation happening
+- VISUAL SPECIFICS: Colors, shapes, positions, movements - not emotions or atmosphere
+- PRESENT TENSE: Describe what IS happening, not what "begins to" happen
 
-Example:
-Grounding: "A young woman with red hair in a sunlit forest clearing"
-User input: "now it's raining"
-Output: A young woman with red hair stands in a forest clearing as rain begins to fall, droplets catching the diffused gray light filtering through the canopy, her hair becoming wet and clinging to her face, mist rising from the damp earth around her feet, the forest taking on a moody atmospheric quality."""
+FORMAT: "[Subject] [action verb] [specific visual details]. [Motion/temporal description]."
+
+EXAMPLES:
+
+Input: "A red sports car" + "it transforms into a robot"
+OUTPUT: Red sports car's panels split and unfold, hood becoming arms, wheels rotating into legs, chassis rising vertical. Metal parts click into humanoid form, crimson paint visible on robotic torso.
+
+Input: "A young woman with red hair in a forest" + "she ages 50 years"
+OUTPUT: Woman's face wrinkles deeply, red hair turns gray then white, posture hunches forward, hands become weathered. Aging progresses visibly across her features over seconds.
+
+Input: "A cat on a windowsill" + "it jumps down"
+OUTPUT: Orange cat leaps from windowsill, body arcing downward, legs extending for landing. Fur ripples with motion, tail trails behind for balance.
+
+BAD (too verbose): "The majestic red sports car begins its dramatic transformation as gleaming metal panels elegantly unfold..."
+GOOD (concise): "Red car's panels split open, revealing mechanical joints. Hood rises as arms, wheels become legs."
+
+Output ONLY the enhanced prompt. No explanations."""
 
     def __init__(self, api_key: str):
         self.client = anthropic.Anthropic(api_key=api_key)
@@ -80,43 +92,54 @@ Output: A young woman with red hair stands in a forest clearing as rain begins t
         self.grounding = grounding
         self.previous_prompts = []
         
-        # Enhance the initial grounding
+        # Enhance the initial grounding - keep it concise
         enhanced = self._call_claude(
-            f"Enhance this initial scene description into a detailed video prompt. "
-            f"This will be the grounding for a multi-part video:\n\n{grounding}"
+            f"""Create a concise visual grounding for a video. This is the STARTING STATE.
+
+User's description: {grounding}
+
+Output format: "[Subject with key visual details] [position/setting] [one distinguishing feature]."
+Keep it to 1-2 sentences max. Focus on: what it looks like, where it is, one unique detail."""
         )
         self.previous_prompts.append(enhanced)
         return enhanced
     
-    def enhance_prompt(self, user_input: str) -> str:
+    def enhance_prompt(self, user_input: str, add_to_history: bool = True) -> str:
         """Enhance a user's short prompt while maintaining grounding"""
         if not self.grounding:
             raise ValueError("Grounding must be set first")
         
-        # Build context from previous prompts
-        context = ""
-        if self.previous_prompts:
-            context = f"\n\nPrevious scene: {self.previous_prompts[-1]}"
+        # Determine current state - either from last prompt or initial grounding
+        if len(self.previous_prompts) > 1:
+            current_state = self.previous_prompts[-1]
+            state_label = "CURRENT STATE (scene has evolved)"
+        else:
+            current_state = self.grounding
+            state_label = "INITIAL STATE"
         
-        message = f"""Grounding (subject + setting that MUST be maintained):
-{self.grounding}
-{context}
+        message = f"""{state_label}:
+{current_state}
 
-User's change/new description:
+CHANGE REQUESTED:
 {user_input}
 
-Create an enhanced video prompt that incorporates this change while maintaining the grounding:"""
+Create a concise 2-sentence prompt. Sentence 1: visual changes. Sentence 2: motion/action."""
 
         enhanced = self._call_claude(message)
-        self.previous_prompts.append(enhanced)
+        if add_to_history:
+            self.previous_prompts.append(enhanced)
         return enhanced
+    
+    def add_to_history(self, prompt: str):
+        """Add a prompt to history (for manually edited prompts)"""
+        self.previous_prompts.append(prompt)
     
     def _call_claude(self, message: str) -> str:
         """Call Claude API to enhance prompt"""
         try:
             response = self.client.messages.create(
                 model="claude-sonnet-4-20250514",
-                max_tokens=300,
+                max_tokens=150,  # Force brevity
                 system=self.SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": message}]
             )
@@ -791,6 +814,7 @@ class InteractiveVideoBuilderWithAI:
         print("="*70)
         print("\nDescribe the main subject and setting.")
         print("Example: 'A young woman with red hair standing in a misty forest'")
+        print("Tip: Start with 'No AI:' to skip enhancement")
         print()
         
         while True:
@@ -799,12 +823,74 @@ class InteractiveVideoBuilderWithAI:
                 break
             print("  Please enter a grounding prompt.")
         
-        print("\n  [Enhancing grounding with AI...]")
-        enhanced_grounding = self.enhancer.set_grounding(grounding_input)
-        self.grounding_set = True
+        # Check if user wants to skip AI
+        if grounding_input.lower().startswith('no ai:') or grounding_input.lower().startswith('no ai '):
+            enhanced_grounding = grounding_input[6:].strip() if grounding_input.lower().startswith('no ai:') else grounding_input[5:].strip()
+            print(f"\n  [Using grounding directly without AI enhancement]")
+            self.enhancer.grounding = enhanced_grounding
+            self.enhancer.previous_prompts = [enhanced_grounding]
+        else:
+            print("\n  [Enhancing grounding with AI...]")
+            enhanced_grounding = self.enhancer.set_grounding(grounding_input)
+            
+            print(f"\n  Your input: {grounding_input}")
+            print(f"\n  ┌─ AI Enhanced Grounding ─────────────────────────────────")
+            words = enhanced_grounding.split()
+            line = "  │ "
+            for word in words:
+                if len(line) + len(word) + 1 > 80:
+                    print(line)
+                    line = "  │ " + word + " "
+                else:
+                    line += word + " "
+            if line.strip() != "│":
+                print(line)
+            print("  └────────────────────────────────────────────────────────")
+            
+            # Interactive approval for grounding
+            while True:
+                print("\n  Options: [Enter]=Accept, [r]=Regenerate, [e]=Edit manually")
+                choice = input("  Your choice: ").strip().lower()
+                
+                if choice == '' or choice == 'y' or choice == 'yes':
+                    break
+                elif choice == 'r' or choice == 'regenerate':
+                    print("  [Regenerating...]")
+                    self.enhancer.previous_prompts = []
+                    enhanced_grounding = self.enhancer.set_grounding(grounding_input)
+                    print(f"\n  ┌─ AI Enhanced Grounding (regenerated) ────────────────")
+                    words = enhanced_grounding.split()
+                    line = "  │ "
+                    for word in words:
+                        if len(line) + len(word) + 1 > 80:
+                            print(line)
+                            line = "  │ " + word + " "
+                        else:
+                            line += word + " "
+                    if line.strip() != "│":
+                        print(line)
+                    print("  └────────────────────────────────────────────────────────")
+                    continue
+                elif choice == 'e' or choice == 'edit':
+                    print("\n  Enter your edited grounding (press Enter twice to finish):")
+                    lines = []
+                    while True:
+                        line = input("  > ")
+                        if line == "":
+                            if lines:
+                                break
+                        else:
+                            lines.append(line)
+                    enhanced_grounding = " ".join(lines)
+                    self.enhancer.grounding = enhanced_grounding
+                    self.enhancer.previous_prompts = [enhanced_grounding]
+                    print(f"  [Using edited grounding]")
+                    break
+                else:
+                    print("  Invalid choice. Enter, 'r', or 'e'")
         
-        print(f"\n  Your input: {grounding_input}")
-        print(f"  Enhanced:   {enhanced_grounding}")
+        self.grounding_set = True
+        print(f"\n  ✓ Grounding set: {enhanced_grounding[:60]}...")
         
         # Step 2: Interactive chunk generation
         print("\n" + "="*70)
@@ -812,11 +898,13 @@ class InteractiveVideoBuilderWithAI:
         print("="*70)
         print("\nCommands:")
         print("  - Enter a prompt/change for the next ~10s chunk")
+        print("  - 'No AI: <prompt>' - Use prompt directly without AI enhancement")
         print("  - 'list' - Show all generated chunks")
         print("  - 'back' - Go back one chunk")
         print("  - 'goto N' - Go to chunk N for re-editing")
         print("  - 'done' - Finish and save final video")
         print("  - 'quit' - Exit without saving")
+        print("\nAfter AI enhancement, you can: Accept (Enter), Regenerate (r), or Edit (e)")
         print()
         
         while self.current_chunk < self.max_chunks:
@@ -861,10 +949,77 @@ class InteractiveVideoBuilderWithAI:
                     print("  Usage: goto N (e.g., 'goto 2')")
                 continue
             
-            # Enhance the prompt with AI
-            print("  [Enhancing prompt with AI...]")
-            processed_prompt = self.enhancer.enhance_prompt(user_input)
-            print(f"  Enhanced: {processed_prompt[:100]}...")
+            # Check if user wants to skip AI enhancement
+            if user_input.lower().startswith('no ai:') or user_input.lower().startswith('no ai '):
+                # Remove the "No AI:" prefix and use the rest directly
+                processed_prompt = user_input[6:].strip() if user_input.lower().startswith('no ai:') else user_input[5:].strip()
+                print(f"\n  [Using prompt directly without AI enhancement]")
+                print(f"  Prompt: {processed_prompt}")
+                self.enhancer.add_to_history(processed_prompt)
+            else:
+                # Enhance the prompt with AI
+                print("  [Enhancing prompt with AI...]")
+                processed_prompt = self.enhancer.enhance_prompt(user_input, add_to_history=False)
+                
+                # Show full enhanced prompt and get user approval
+                print(f"\n  ┌─ AI Enhanced Prompt ─────────────────────────────────")
+                # Word wrap the prompt for display
+                words = processed_prompt.split()
+                line = "  │ "
+                for word in words:
+                    if len(line) + len(word) + 1 > 80:
+                        print(line)
+                        line = "  │ " + word + " "
+                    else:
+                        line += word + " "
+                if line.strip() != "│":
+                    print(line)
+                print("  └────────────────────────────────────────────────────────")
+                
+                # Interactive approval loop
+                while True:
+                    print("\n  Options: [Enter]=Accept, [r]=Regenerate, [e]=Edit manually")
+                    choice = input("  Your choice: ").strip().lower()
+                    
+                    if choice == '' or choice == 'y' or choice == 'yes':
+                        # Accept the prompt
+                        self.enhancer.add_to_history(processed_prompt)
+                        break
+                    elif choice == 'r' or choice == 'regenerate':
+                        # Regenerate with AI
+                        print("  [Regenerating...]")
+                        processed_prompt = self.enhancer.enhance_prompt(user_input, add_to_history=False)
+                        print(f"\n  ┌─ AI Enhanced Prompt (regenerated) ──────────────────")
+                        words = processed_prompt.split()
+                        line = "  │ "
+                        for word in words:
+                            if len(line) + len(word) + 1 > 80:
+                                print(line)
+                                line = "  │ " + word + " "
+                            else:
+                                line += word + " "
+                        if line.strip() != "│":
+                            print(line)
+                        print("  └────────────────────────────────────────────────────────")
+                        continue
+                    elif choice == 'e' or choice == 'edit':
+                        # Let user edit manually
+                        print("\n  Enter your edited prompt (or paste the AI version and modify):")
+                        print("  (Press Enter twice to finish)")
+                        lines = []
+                        while True:
+                            line = input("  > ")
+                            if line == "":
+                                if lines:
+                                    break
+                            else:
+                                lines.append(line)
+                        processed_prompt = " ".join(lines)
+                        self.enhancer.add_to_history(processed_prompt)
+                        print(f"  [Using edited prompt]")
+                        break
+                    else:
+                        print("  Invalid choice. Enter, 'r', or 'e'")
             
             # Generate the chunk (with warmup if coming back from later chunk)
             self.generate_chunk(
