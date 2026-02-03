@@ -367,6 +367,10 @@ def reset_session():
             None,  # video
             "",  # grounding input
             "",  # enhanced grounding
+            gr.update(visible=False),  # grounding_approval
+            "",  # chunk input
+            "",  # enhanced chunk
+            gr.update(visible=False),  # chunk_approval
         )
     
     result = builder.reset()
@@ -380,6 +384,10 @@ def reset_session():
             None,
             "",
             "",
+            gr.update(visible=False),
+            "",
+            "",
+            gr.update(visible=False),
         )
     
     status = f"""Session reset!
@@ -397,6 +405,10 @@ Ready for a new video. Enter a grounding prompt below."""
         None,  # Clear video
         "",  # Clear grounding input
         "",  # Clear enhanced grounding
+        gr.update(visible=False),  # Hide grounding approval
+        "",  # Clear chunk input
+        "",  # Clear enhanced chunk
+        gr.update(visible=False),  # Hide chunk approval
     )
 
 
@@ -553,7 +565,7 @@ Build AI-generated videos chunk by chunk with natural language prompts.
         reset_btn.click(
             fn=reset_session,
             inputs=[],
-            outputs=[status_box, grounding_section, chunk_section, history_table, video_player, grounding_input, enhanced_grounding]
+            outputs=[status_box, grounding_section, chunk_section, history_table, video_player, grounding_input, enhanced_grounding, grounding_approval, chunk_input, enhanced_chunk, chunk_approval]
         )
     
     return demo

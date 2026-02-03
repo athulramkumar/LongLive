@@ -43,37 +43,47 @@ class ChunkState:
 class PromptEnhancer:
     """Uses Anthropic Claude to enhance prompts while maintaining grounding"""
     
-    SYSTEM_PROMPT = """You are a video prompt engineer. Your job is to create CONCISE, EFFECTIVE prompts for AI video generation.
+    SYSTEM_PROMPT = """You are a video prompt engineer for LongLive, an AI video generation model that excels at cinematic long takes with smooth transitions.
 
-STRUCTURE (follow this exactly):
-1. GROUNDING: State the subject and current setting (1 short phrase)
-2. CHANGE: What is visually different/happening (specific details)
-3. MOTION: How things are moving in the scene (temporal description)
+YOUR PRIMARY GOAL: Maintain maximum continuity by making MINIMAL changes to the previous prompt. Only modify what the user explicitly requests.
 
-RULES:
-- BE CONCISE: Maximum 2 sentences total. Every word must serve a purpose.
-- NO FLUFF: Cut adjectives like "dramatic", "majestic", "beautiful" - they waste tokens
-- EXECUTE THE ACTION: User says "transforms" = describe transformation happening
-- VISUAL SPECIFICS: Colors, shapes, positions, movements - not emotions or atmosphere
-- PRESENT TENSE: Describe what IS happening, not what "begins to" happen
+PROMPT COMPONENTS (understand these):
+1. SUBJECT: The main character/object (who/what) - appearance, clothing, colors
+2. SETTING/BACKGROUND: The environment (where) - location, atmosphere, lighting
+3. ACTION: What is physically happening - movements, transformations
+4. STYLE: Visual style - color grading, lighting mood, artistic style
+5. MOTION: Temporal flow - how movement progresses over time
 
-FORMAT: "[Subject] [action verb] [specific visual details]. [Motion/temporal description]."
+CRITICAL RULES FOR CONTINUITY:
 
-EXAMPLES:
+1. PRESERVE THE PREVIOUS PROMPT: Start with the previous chunk's prompt as your base. Only modify the specific element the user mentions.
 
-Input: "A red sports car" + "it transforms into a robot"
-OUTPUT: Red sports car's panels split and unfold, hood becoming arms, wheels rotating into legs, chassis rising vertical. Metal parts click into humanoid form, crimson paint visible on robotic torso.
+2. MINIMAL CHANGES ONLY:
+   - User says "change background" → Keep subject, action, style, motion exactly the same. Only change background.
+   - User says "make it night time" → Keep subject, background layout, action. Only change lighting/time.
+   - User says "she starts dancing" → Keep subject appearance, setting, style. Only change action.
+   - User says "add rain" → Keep everything, just add rain to the scene.
+   - User says "zoom out" or "wider shot" → Keep everything, imply the framing change naturally.
 
-Input: "A young woman with red hair in a forest" + "she ages 50 years"
-OUTPUT: Woman's face wrinkles deeply, red hair turns gray then white, posture hunches forward, hands become weathered. Aging progresses visibly across her features over seconds.
+3. ELEMENT-SPECIFIC CHANGES:
+   - "change subject" / "transform into" → Modify subject only, preserve setting + action type
+   - "change background" / "different location" → Modify setting only, preserve subject + action
+   - "change style" / "make it darker" → Modify style/lighting only, preserve subject + setting + action
+   - "change action" / "now she runs" → Modify action only, preserve subject + setting + style
 
-Input: "A cat on a windowsill" + "it jumps down"
-OUTPUT: Orange cat leaps from windowsill, body arcing downward, legs extending for landing. Fur ripples with motion, tail trails behind for balance.
+4. ADDITIVE CHANGES:
+   - "add [object]" → Insert object into existing scene, change nothing else
+   - "remove [object]" → Remove object, keep everything else identical
+   - "it starts raining" → Add weather effect, preserve all else
 
-BAD (too verbose): "The majestic red sports car begins its dramatic transformation as gleaming metal panels elegantly unfold..."
-GOOD (concise): "Red car's panels split open, revealing mechanical joints. Hood rises as arms, wheels become legs."
+LONGLIVE LIMITATIONS (avoid these):
+- Do NOT write "camera pans", "cut to", "zoom in" - camera motion emerges naturally
+- Do NOT request rapid shot changes or cuts
+- Keep transitions smooth and gradual
 
-Output ONLY the enhanced prompt. No explanations."""
+FORMAT: 2-3 sentences maximum. Start with subject + setting, then action/change, then motion.
+
+Output ONLY the enhanced prompt. No explanations or commentary."""
 
     def __init__(self, api_key: str):
         self.client = anthropic.Anthropic(api_key=api_key)
@@ -86,12 +96,21 @@ Output ONLY the enhanced prompt. No explanations."""
         self.previous_prompts = []
         
         enhanced = self._call_claude(
-            f"""Create a concise visual grounding for a video. This is the STARTING STATE.
+            f"""Create a concise visual grounding for a video. This establishes the SUBJECT and SETTING that will anchor all future prompts.
 
 User's description: {grounding}
 
-Output format: "[Subject with key visual details] [position/setting] [one distinguishing feature]."
-Keep it to 1-2 sentences max. Focus on: what it looks like, where it is, one unique detail."""
+REQUIREMENTS:
+1. SUBJECT (who/what): Clearly identify the main subject with key visual details (appearance, clothing, colors)
+2. SETTING (where): Establish the background/environment clearly
+3. One distinguishing visual feature
+
+Format: "[Subject with visual details] in/at [specific setting with atmosphere]."
+Keep it to 1-2 sentences. Be specific about visual details that should persist across the video.
+
+Example: "A young woman with flowing auburn hair and a white summer dress stands in a sunlit meadow dotted with wildflowers, morning mist hovering at knee height."
+
+Output ONLY the grounding. No explanations."""
         )
         self.previous_prompts.append(enhanced)
         return enhanced
@@ -106,20 +125,54 @@ Keep it to 1-2 sentences max. Focus on: what it looks like, where it is, one uni
         if not self.grounding:
             raise ValueError("Grounding must be set first")
         
+        # Determine if this is the first chunk or a continuation
         if len(self.previous_prompts) > 1:
-            current_state = self.previous_prompts[-1]
-            state_label = "CURRENT STATE (scene has evolved)"
+            previous_prompt = self.previous_prompts[-1]
+            is_first_chunk = False
         else:
-            current_state = self.grounding
-            state_label = "INITIAL STATE"
+            previous_prompt = self.previous_prompts[0]  # Enhanced grounding
+            is_first_chunk = True
         
-        message = f"""{state_label}:
-{current_state}
+        if is_first_chunk:
+            message = f"""GROUNDING (this is the first chunk):
+{self.grounding}
 
-CHANGE REQUESTED:
+ENHANCED GROUNDING:
+{previous_prompt}
+
+USER REQUEST:
 {user_input}
 
-Create a concise 2-sentence prompt. Sentence 1: visual changes. Sentence 2: motion/action."""
+This is the FIRST chunk. Create a prompt that:
+1. Uses the enhanced grounding as your base
+2. Adds the action/change the user requested
+3. Includes motion/temporal description
+
+Keep it to 2-3 sentences. Output only the prompt."""
+        else:
+            message = f"""ORIGINAL GROUNDING:
+{self.grounding}
+
+PREVIOUS CHUNK'S PROMPT (use this as your base - preserve as much as possible):
+{previous_prompt}
+
+USER'S REQUESTED CHANGE:
+{user_input}
+
+INSTRUCTIONS:
+1. Start with the PREVIOUS CHUNK'S PROMPT as your base
+2. Identify what specific element the user wants to change:
+   - Subject change? → Only modify the subject description
+   - Background change? → Only modify the setting/environment
+   - Action change? → Only modify what's happening
+   - Style change? → Only modify lighting/mood/colors
+   - Addition? → Add the new element, keep everything else
+3. PRESERVE everything the user did NOT mention changing
+4. Maintain the same sentence structure when possible
+
+The goal is CONTINUITY. Make the MINIMUM changes needed to fulfill the user's request.
+
+Output only the new prompt (2-3 sentences max). No explanations."""
 
         enhanced = self._call_claude(message)
         if add_to_history:
