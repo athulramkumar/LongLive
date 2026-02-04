@@ -21,6 +21,21 @@ from web_ui.video_builder_state import VideoBuilderState
 builder: Optional[VideoBuilderState] = None
 
 
+def get_gpu_memory_stats() -> str:
+    """Get GPU memory statistics"""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            total = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            allocated = torch.cuda.memory_allocated(0) / (1024**3)
+            reserved = torch.cuda.memory_reserved(0) / (1024**3)
+            free = total - reserved
+            return f"**GPU Memory:** {allocated:.1f}GB used / {total:.1f}GB total ({free:.1f}GB free)"
+        return "GPU: Not available"
+    except Exception as e:
+        return f"GPU: Error getting stats - {e}"
+
+
 def create_builder():
     """Create a new VideoBuilderState instance"""
     global builder
@@ -214,18 +229,24 @@ def generate_chunk(user_input: str, processed_prompt: str, skip_ai: bool, progre
         next_start = builder.current_chunk * builder.chunk_duration
         next_end = next_start + builder.chunk_duration
         
+        gpu_stats = get_gpu_memory_stats()
+        
         status = f"""Chunk {chunk_num} generated in {result['generation_time']}!
 
 **Time range:** {result['time_range']}
 **Video saved:** {result['chunk_video']}
 
+{gpu_stats}
+
 Ready for chunk {next_chunk} ({next_start:.0f}-{next_end:.0f}s)"""
         
-        video_path = result["running_video"]
+        chunk_video_path = result["chunk_video"]  # Last chunk only
+        full_video_path = result["running_video"]  # Full video so far
         
         return (
             status,
-            video_path,
+            chunk_video_path,  # Last chunk
+            full_video_path,   # Full video
             history_data,
             gr.update(visible=False),  # Hide approval section
             "",  # Clear prompt input
@@ -233,6 +254,7 @@ Ready for chunk {next_chunk} ({next_start:.0f}-{next_end:.0f}s)"""
     except Exception as e:
         return (
             f"Generation failed: {str(e)}",
+            None,
             None,
             [],
             gr.update(visible=True),
@@ -245,12 +267,12 @@ def go_back_handler():
     global builder
     
     if not builder:
-        return "Error: No session", [], None
+        return "Error: No session", [], None, None
     
     result = builder.go_back()
     
     if result["status"] == "error":
-        return result["message"], get_history_data(), None
+        return result["message"], get_history_data(), None, None
     
     chunks = builder.get_chunks_info()
     history_data = [
@@ -258,17 +280,22 @@ def go_back_handler():
         for c in chunks
     ]
     
-    # Get the running video for the previous chunk
-    video_path = None
+    # Get video paths for the current chunk
+    chunk_video_path = None
+    full_video_path = None
     if builder.current_chunk > 0:
-        video_path = os.path.join(builder.session_dir, f"running_{builder.current_chunk}.mp4")
-        if not os.path.exists(video_path):
-            video_path = None
+        chunk_video_path = os.path.join(builder.session_dir, f"chunk_{builder.current_chunk}.mp4")
+        full_video_path = os.path.join(builder.session_dir, f"running_{builder.current_chunk}.mp4")
+        if not os.path.exists(chunk_video_path):
+            chunk_video_path = None
+        if not os.path.exists(full_video_path):
+            full_video_path = None
     
     return (
         f"Rewound to chunk {builder.current_chunk + 1}. Enter a new prompt.",
         history_data,
-        video_path
+        chunk_video_path,
+        full_video_path
     )
 
 
@@ -277,15 +304,15 @@ def goto_chunk_handler(target: int):
     global builder
     
     if not builder:
-        return "Error: No session", [], None
+        return "Error: No session", [], None, None
     
     if not target or target < 1:
-        return "Enter a valid chunk number", get_history_data(), None
+        return "Enter a valid chunk number", get_history_data(), None, None
     
     result = builder.goto_chunk(int(target))
     
     if result["status"] == "error":
-        return result["message"], get_history_data(), None
+        return result["message"], get_history_data(), None, None
     
     chunks = builder.get_chunks_info()
     history_data = [
@@ -293,16 +320,21 @@ def goto_chunk_handler(target: int):
         for c in chunks
     ]
     
-    video_path = None
+    chunk_video_path = None
+    full_video_path = None
     if builder.current_chunk > 0:
-        video_path = os.path.join(builder.session_dir, f"running_{builder.current_chunk}.mp4")
-        if not os.path.exists(video_path):
-            video_path = None
+        chunk_video_path = os.path.join(builder.session_dir, f"chunk_{builder.current_chunk}.mp4")
+        full_video_path = os.path.join(builder.session_dir, f"running_{builder.current_chunk}.mp4")
+        if not os.path.exists(chunk_video_path):
+            chunk_video_path = None
+        if not os.path.exists(full_video_path):
+            full_video_path = None
     
     return (
         f"Rewound to chunk {builder.current_chunk + 1}. Enter a new prompt.",
         history_data,
-        video_path
+        chunk_video_path,
+        full_video_path
     )
 
 
@@ -364,7 +396,8 @@ def reset_session():
             gr.update(visible=True),   # grounding_section
             gr.update(visible=False),  # chunk_section
             [],  # history
-            None,  # video
+            None,  # chunk video
+            None,  # full video
             "",  # grounding input
             "",  # enhanced grounding
             gr.update(visible=False),  # grounding_approval
@@ -381,6 +414,7 @@ def reset_session():
             gr.update(visible=True),
             gr.update(visible=False),
             [],
+            None,
             None,
             "",
             "",
@@ -402,7 +436,8 @@ Ready for a new video. Enter a grounding prompt below."""
         gr.update(visible=True),   # Show grounding section
         gr.update(visible=False),  # Hide chunk section
         [],  # Clear history
-        None,  # Clear video
+        None,  # Clear chunk video
+        None,  # Clear full video
         "",  # Clear grounding input
         "",  # Clear enhanced grounding
         gr.update(visible=False),  # Hide grounding approval
@@ -478,7 +513,10 @@ Build AI-generated videos chunk by chunk with natural language prompts.
                             chunk_regen_btn = gr.Button("Regenerate")
                 
                 with gr.Column(scale=2):
-                    video_player = gr.Video(label="Current Video", interactive=False)
+                    gr.Markdown("**Last Generated Chunk:**")
+                    chunk_video_player = gr.Video(label="Last Chunk", interactive=False, height=200)
+                    gr.Markdown("**Full Video So Far:**")
+                    full_video_player = gr.Video(label="Full Video", interactive=False, height=200)
             
             # History and navigation
             gr.Markdown("### Generated Chunks")
@@ -541,19 +579,19 @@ Build AI-generated videos chunk by chunk with natural language prompts.
         chunk_accept_btn.click(
             fn=generate_chunk,
             inputs=[chunk_input, enhanced_chunk, chunk_skip_ai],
-            outputs=[status_box, video_player, history_table, chunk_approval, chunk_input]
+            outputs=[status_box, chunk_video_player, full_video_player, history_table, chunk_approval, chunk_input]
         )
         
         back_btn.click(
             fn=go_back_handler,
             inputs=[],
-            outputs=[status_box, history_table, video_player]
+            outputs=[status_box, history_table, chunk_video_player, full_video_player]
         )
         
         goto_btn.click(
             fn=goto_chunk_handler,
             inputs=[goto_input],
-            outputs=[status_box, history_table, video_player]
+            outputs=[status_box, history_table, chunk_video_player, full_video_player]
         )
         
         finalize_btn.click(
@@ -565,7 +603,7 @@ Build AI-generated videos chunk by chunk with natural language prompts.
         reset_btn.click(
             fn=reset_session,
             inputs=[],
-            outputs=[status_box, grounding_section, chunk_section, history_table, video_player, grounding_input, enhanced_grounding, grounding_approval, chunk_input, enhanced_chunk, chunk_approval]
+            outputs=[status_box, grounding_section, chunk_section, history_table, chunk_video_player, full_video_player, grounding_input, enhanced_grounding, grounding_approval, chunk_input, enhanced_chunk, chunk_approval]
         )
     
     return demo
