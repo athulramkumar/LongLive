@@ -5,6 +5,7 @@ Refactored from interactive_demo_anthropic.py to be web-compatible.
 Removes all input() calls and exposes clean methods for Gradio integration.
 """
 
+import gc
 import os
 import sys
 import json
@@ -43,141 +44,199 @@ class ChunkState:
 class PromptEnhancer:
     """Uses Anthropic Claude to enhance prompts while maintaining grounding"""
     
-    SYSTEM_PROMPT = """You are a video prompt engineer for LongLive, an AI video generation model that excels at cinematic long takes with smooth transitions.
+    SYSTEM_PROMPT = """You are a video prompt engineer for LongLive, an AI video generation model.
 
-YOUR PRIMARY GOAL: Maintain maximum continuity by making MINIMAL changes to the previous prompt. Only modify what the user explicitly requests.
+Output ONLY valid JSON:
+```json
+{
+  "edits": "Brief description of what you changed",
+  "scene": "Environment, setting, lighting, weather, style/aesthetic",
+  "subject": "Primary subject with visual traits (appearance, clothing, features)",
+  "action": "What happens in this 10-second chunk (1-2 sentences)",
+  "locks": ["Elements fixed across chunks"]
+}
+```
 
-PROMPT COMPONENTS (understand these):
-1. SUBJECT: The main character/object (who/what) - appearance, clothing, colors
-2. SETTING/BACKGROUND: The environment (where) - location, atmosphere, lighting
-3. ACTION: What is physically happening - movements, transformations
-4. STYLE: Visual style - color grading, lighting mood, artistic style
-5. MOTION: Temporal flow - how movement progresses over time
+ANALYZE the user's request and INFER which fields to modify:
+- Location/background/environment changes → update "scene"
+- Lighting/weather/time of day changes → update "scene"
+- Style/aesthetic/mood changes → update "scene" (style is part of scene)
+- Character/object appearance changes → update "subject"
+- Movement/event/action changes → update "action"
+- Multiple aspects → update only the relevant fields
 
-CRITICAL RULES FOR CONTINUITY:
+EXAMPLES:
+- "add rain" → scene edit (weather)
+- "she starts running" → action edit
+- "change to sunset" → scene edit (lighting/time)
+- "make it cinematic" → scene edit (style)
+- "she puts on a hat" → subject + action edit
+- "zoom out to reveal the city" → scene + action edit
 
-1. PRESERVE THE PREVIOUS PROMPT: Start with the previous chunk's prompt as your base. Only modify the specific element the user mentions.
+RULES:
+1. INFER the edit type from user's natural language - don't require explicit field names
+2. MINIMAL CHANGES - only modify fields affected by the user's request
+3. COPY unchanged fields exactly from the previous state
+4. LOCKS preserve continuity - update only if the locked element itself changes
 
-2. MINIMAL CHANGES ONLY:
-   - User says "change background" → Keep subject, action, style, motion exactly the same. Only change background.
-   - User says "make it night time" → Keep subject, background layout, action. Only change lighting/time.
-   - User says "she starts dancing" → Keep subject appearance, setting, style. Only change action.
-   - User says "add rain" → Keep everything, just add rain to the scene.
-   - User says "zoom out" or "wider shot" → Keep everything, imply the framing change naturally.
-
-3. ELEMENT-SPECIFIC CHANGES:
-   - "change subject" / "transform into" → Modify subject only, preserve setting + action type
-   - "change background" / "different location" → Modify setting only, preserve subject + action
-   - "change style" / "make it darker" → Modify style/lighting only, preserve subject + setting + action
-   - "change action" / "now she runs" → Modify action only, preserve subject + setting + style
-
-4. ADDITIVE CHANGES:
-   - "add [object]" → Insert object into existing scene, change nothing else
-   - "remove [object]" → Remove object, keep everything else identical
-   - "it starts raining" → Add weather effect, preserve all else
-
-LONGLIVE LIMITATIONS (avoid these):
-- Do NOT write "camera pans", "cut to", "zoom in" - camera motion emerges naturally
-- Do NOT request rapid shot changes or cuts
-- Keep transitions smooth and gradual
-
-FORMAT: 2-3 sentences maximum. Start with subject + setting, then action/change, then motion.
-
-Output ONLY the enhanced prompt. No explanations or commentary."""
+Output ONLY valid JSON."""
 
     def __init__(self, api_key: str):
         self.client = anthropic.Anthropic(api_key=api_key)
         self.grounding: Optional[str] = None
-        self.previous_prompts: List[str] = []
+        self.previous_prompts: List[str] = []  # Flat text prompts for video model
+        self.structured_states: List[Dict] = []  # Structured JSON states for continuity
     
     def set_grounding(self, grounding: str) -> str:
         """Set the initial grounding and return an enhanced version"""
         self.grounding = grounding
         self.previous_prompts = []
+        self.structured_states = []
         
-        enhanced = self._call_claude(
-            f"""Create a concise visual grounding for a video. This establishes the SUBJECT and SETTING that will anchor all future prompts.
+        # Generate initial structured state with simplified 5-field format
+        structured_response = self._call_claude(
+            f"""Create the initial GROUNDING state for a video.
 
 User's description: {grounding}
 
-REQUIREMENTS:
-1. SUBJECT (who/what): Clearly identify the main subject with key visual details (appearance, clothing, colors)
-2. SETTING (where): Establish the background/environment clearly
-3. One distinguishing visual feature
+Output JSON with ONLY these 5 fields:
+```json
+{{
+  "edits": "initial",
+  "scene": "Environment, setting, lighting, weather, visual style",
+  "subject": "Primary subject with visual traits (appearance, clothing, features)",
+  "action": "Initial state or subtle motion",
+  "locks": ["subject identity", "key visual elements to preserve"]
+}}
+```
 
-Format: "[Subject with visual details] in/at [specific setting with atmosphere]."
-Keep it to 1-2 sentences. Be specific about visual details that should persist across the video.
-
-Example: "A young woman with flowing auburn hair and a white summer dress stands in a sunlit meadow dotted with wildflowers, morning mist hovering at knee height."
-
-Output ONLY the grounding. No explanations."""
+Output ONLY valid JSON."""
         )
-        self.previous_prompts.append(enhanced)
-        return enhanced
+        
+        # Parse and store structured state
+        structured_state = self._parse_json_response(structured_response)
+        if structured_state:
+            self.structured_states.append(structured_state)
+            # Convert to flat text prompt for video model
+            flat_prompt = self._structured_to_flat(structured_state)
+        else:
+            # Fallback: create a simple flat prompt from grounding
+            flat_prompt = f"{grounding}. Scene establishing shot with natural lighting."
+        
+        self.previous_prompts.append(flat_prompt)
+        
+        return flat_prompt
+    
+    def _parse_json_response(self, response: str) -> Optional[Dict]:
+        """Parse JSON from Claude's response"""
+        try:
+            # Try to extract JSON from response
+            import re
+            # Look for JSON block
+            json_match = re.search(r'```json\s*(.*?)\s*```', response, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group(1))
+            # Try parsing the whole response as JSON
+            return json.loads(response)
+        except (json.JSONDecodeError, AttributeError):
+            # If parsing fails, return None
+            return None
+    
+    def _structured_to_flat(self, state: Dict) -> str:
+        """Convert structured state to display format (JSON for UI)."""
+        if not state:
+            return ""
+        
+        # Return formatted JSON for display
+        return json.dumps(state, indent=2)
+    
+    def _structured_to_video_prompt(self, state: Dict) -> str:
+        """Convert structured state to flat text prompt for video model."""
+        if not state:
+            return ""
+        
+        parts = []
+        
+        # Subject + Scene + Action
+        if state.get("subject"):
+            parts.append(state["subject"])
+        if state.get("scene"):
+            parts.append(f"in {state['scene']}")
+        if state.get("action"):
+            parts.append(state["action"])
+        
+        return ". ".join(filter(None, parts))
     
     def set_grounding_direct(self, grounding: str):
         """Set grounding directly without AI enhancement"""
         self.grounding = grounding
         self.previous_prompts = [grounding]
+        self.structured_states = []  # No structured state for direct grounding
     
     def enhance_prompt(self, user_input: str, add_to_history: bool = True) -> str:
         """Enhance a user's short prompt while maintaining grounding"""
         if not self.grounding:
             raise ValueError("Grounding must be set first")
         
-        # Determine if this is the first chunk or a continuation
-        if len(self.previous_prompts) > 1:
-            previous_prompt = self.previous_prompts[-1]
-            is_first_chunk = False
-        else:
-            previous_prompt = self.previous_prompts[0]  # Enhanced grounding
-            is_first_chunk = True
+        # Get previous structured state if available
+        prev_state = self.structured_states[-1] if self.structured_states else None
         
-        if is_first_chunk:
-            message = f"""GROUNDING (this is the first chunk):
-{self.grounding}
+        if prev_state:
+            # Pass the previous JSON and ask Claude to modify it
+            prev_state_json = json.dumps(prev_state, indent=2)
+            
+            message = f"""PREVIOUS STATE:
+```json
+{prev_state_json}
+```
 
-ENHANCED GROUNDING:
-{previous_prompt}
+USER REQUEST: "{user_input}"
 
-USER REQUEST:
-{user_input}
+Analyze what the user wants to change and output modified JSON with ONLY these 5 fields:
+- "edits": what you changed
+- "scene": environment, setting, lighting, style (update if user mentions location/weather/lighting/style)
+- "subject": who/what with visual traits (update if user mentions character/appearance)
+- "action": what happens in this chunk (update if user mentions movement/events)
+- "locks": elements that stay fixed (copy from previous unless a locked element changes)
 
-This is the FIRST chunk. Create a prompt that:
-1. Uses the enhanced grounding as your base
-2. Adds the action/change the user requested
-3. Includes motion/temporal description
+COPY unchanged fields exactly. Output ONLY valid JSON."""
 
-Keep it to 2-3 sentences. Output only the prompt."""
         else:
-            message = f"""ORIGINAL GROUNDING:
-{self.grounding}
+            # First chunk - build from grounding
+            message = f"""GROUNDING: {self.grounding}
 
-PREVIOUS CHUNK'S PROMPT (use this as your base - preserve as much as possible):
-{previous_prompt}
+USER ACTION: "{user_input}"
 
-USER'S REQUESTED CHANGE:
-{user_input}
+Output JSON with ONLY these 5 fields:
+```json
+{{
+  "edits": "initial",
+  "scene": "environment, setting, lighting, style",
+  "subject": "who/what with visual traits",
+  "action": "what happens",
+  "locks": ["subject identity", "key visual elements"]
+}}
+```"""
 
-INSTRUCTIONS:
-1. Start with the PREVIOUS CHUNK'S PROMPT as your base
-2. Identify what specific element the user wants to change:
-   - Subject change? → Only modify the subject description
-   - Background change? → Only modify the setting/environment
-   - Action change? → Only modify what's happening
-   - Style change? → Only modify lighting/mood/colors
-   - Addition? → Add the new element, keep everything else
-3. PRESERVE everything the user did NOT mention changing
-4. Maintain the same sentence structure when possible
-
-The goal is CONTINUITY. Make the MINIMUM changes needed to fulfill the user's request.
-
-Output only the new prompt (2-3 sentences max). No explanations."""
-
-        enhanced = self._call_claude(message)
-        if add_to_history:
-            self.previous_prompts.append(enhanced)
-        return enhanced
+        structured_response = self._call_claude(message)
+        
+        # Parse structured state
+        new_state = self._parse_json_response(structured_response)
+        
+        # Convert to flat prompt for video model
+        if new_state:
+            flat_prompt = self._structured_to_flat(new_state)
+            if add_to_history:
+                self.structured_states.append(new_state)
+                self.previous_prompts.append(flat_prompt)
+            return flat_prompt
+        else:
+            # Fallback if JSON parsing fails - create prompt from previous + user request
+            prev_prompt = self.previous_prompts[-1] if self.previous_prompts else self.grounding
+            flat_prompt = f"[EDIT: {user_input}] {prev_prompt}"
+            if add_to_history:
+                self.previous_prompts.append(flat_prompt)
+            return flat_prompt
     
     def add_to_history(self, prompt: str):
         """Add a prompt to history (for manually edited prompts)"""
@@ -188,7 +247,7 @@ Output only the new prompt (2-3 sentences max). No explanations."""
         try:
             response = self.client.messages.create(
                 model="claude-sonnet-4-20250514",
-                max_tokens=150,
+                max_tokens=1000,  # Increased for JSON output
                 system=self.SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": message}]
             )
@@ -205,6 +264,8 @@ Output only the new prompt (2-3 sentences max). No explanations."""
             keep_count = 1
         if keep_count < len(self.previous_prompts):
             self.previous_prompts = self.previous_prompts[:keep_count]
+        if keep_count < len(self.structured_states):
+            self.structured_states = self.structured_states[:keep_count]
 
 
 class VideoBuilderState:
@@ -504,6 +565,39 @@ class VideoBuilderState:
         return [{k: v.clone() if isinstance(v, torch.Tensor) else v 
                  for k, v in cache.items()} for cache in cache_list]
     
+    def _clear_state_tensors(self, state: ChunkState):
+        """Clear GPU tensors from a ChunkState to free memory"""
+        if state.end_latent is not None:
+            del state.end_latent
+        if state.kv_cache:
+            for cache in state.kv_cache:
+                for k, v in list(cache.items()):
+                    if isinstance(v, torch.Tensor):
+                        del cache[k]
+            state.kv_cache.clear()
+        if state.crossattn_cache:
+            for cache in state.crossattn_cache:
+                for k, v in list(cache.items()):
+                    if isinstance(v, torch.Tensor):
+                        del cache[k]
+            state.crossattn_cache.clear()
+    
+    def _cleanup_old_states(self, keep_last_n: int = 2):
+        """Remove old states to free GPU memory, keeping only last N for go-back"""
+        if len(self.states) <= keep_last_n:
+            return
+        
+        sorted_indices = sorted(self.states.keys())
+        indices_to_remove = sorted_indices[:-keep_last_n]
+        
+        for idx in indices_to_remove:
+            if idx in self.states:
+                self._clear_state_tensors(self.states[idx])
+                del self.states[idx]
+        
+        gc.collect()
+        torch.cuda.empty_cache()
+    
     def _recache_after_switch(self, current_start_frame: int, new_conditional_dict: dict):
         """Recache KV with NEW prompt for dramatic changes"""
         for cache in self.pipeline.kv_cache1:
@@ -763,6 +857,9 @@ class VideoBuilderState:
         # Save outputs
         self._report_progress("Saving video...", 0.85)
         self._save_chunk_outputs(chunk_idx, user_prompt, processed_prompt)
+        
+        # Clean up old states to free GPU memory (keep last 2 for go-back)
+        self._cleanup_old_states(keep_last_n=2)
         self._report_progress("Done!", 1.0)
     
     def _decode_latents_chunked(self, latents, chunk_size=80):
@@ -984,10 +1081,16 @@ class VideoBuilderState:
         if not self.is_setup:
             return {"status": "error", "message": "Model not setup yet"}
         
-        # Clear states
+        # Clear GPU tensors from all states before resetting
+        for state in self.states.values():
+            self._clear_state_tensors(state)
+        
         self.states = {}
         self.current_chunk = 0
         self.grounding_set = False
+        
+        # Force garbage collection
+        gc.collect()
         
         # Reset warm-up tracking
         self.needs_warmup = False
@@ -997,6 +1100,7 @@ class VideoBuilderState:
         if self.enhancer:
             self.enhancer.grounding = None
             self.enhancer.previous_prompts = []
+            self.enhancer.structured_states = []
         
         # Create new session
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
