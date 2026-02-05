@@ -264,8 +264,6 @@ class TestChunkState:
             user_prompt="Test user prompt",
             processed_prompt="Test processed prompt",
             end_latent=mock_tensor,
-            kv_cache=[{"k": mock_tensor, "v": mock_tensor}],
-            crossattn_cache=[{"k": mock_tensor, "v": mock_tensor}],
             current_frame=36
         )
         

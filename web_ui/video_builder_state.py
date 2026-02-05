@@ -34,9 +34,7 @@ class ChunkState:
     chunk_idx: int
     user_prompt: str
     processed_prompt: str
-    end_latent: torch.Tensor
-    kv_cache: List[Dict]
-    crossattn_cache: List[Dict]
+    end_latent: torch.Tensor  # Stored on CPU to save GPU memory
     current_frame: int
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
 
@@ -551,6 +549,7 @@ class VideoBuilderState:
     
     def _initialize_caches(self):
         """Initialize KV caches"""
+        # Simple version matching main branch - let PyTorch handle cleanup
         local_attn_size = self.pipeline.local_attn_size
         if local_attn_size != -1:
             kv_cache_size = local_attn_size * self.pipeline.frame_seq_length
@@ -561,26 +560,14 @@ class VideoBuilderState:
         self.pipeline._initialize_crossattn_cache(1, torch.bfloat16, self.device)
     
     def _copy_cache(self, cache_list):
-        """Deep copy a cache list"""
-        return [{k: v.clone() if isinstance(v, torch.Tensor) else v 
+        """Deep copy a cache list to CPU to save GPU memory"""
+        return [{k: v.clone().cpu() if isinstance(v, torch.Tensor) else v 
                  for k, v in cache.items()} for cache in cache_list]
     
     def _clear_state_tensors(self, state: ChunkState):
-        """Clear GPU tensors from a ChunkState to free memory"""
+        """Clear tensors from a ChunkState to free memory"""
         if state.end_latent is not None:
             del state.end_latent
-        if state.kv_cache:
-            for cache in state.kv_cache:
-                for k, v in list(cache.items()):
-                    if isinstance(v, torch.Tensor):
-                        del cache[k]
-            state.kv_cache.clear()
-        if state.crossattn_cache:
-            for cache in state.crossattn_cache:
-                for k, v in list(cache.items()):
-                    if isinstance(v, torch.Tensor):
-                        del cache[k]
-            state.crossattn_cache.clear()
     
     def _cleanup_old_states(self, keep_last_n: int = 2):
         """Remove old states to free GPU memory, keeping only last N for go-back"""
@@ -615,10 +602,9 @@ class VideoBuilderState:
             return
         
         local_attn_size = self.pipeline.local_attn_size
-        if local_attn_size == -1:
-            num_recache_frames = current_start_frame
-        else:
-            num_recache_frames = min(local_attn_size, current_start_frame)
+        # Limit recache frames to avoid OOM - use 12 as default window size
+        effective_attn_size = local_attn_size if local_attn_size != -1 else 12
+        num_recache_frames = min(effective_attn_size, current_start_frame)
         
         recache_start_frame = current_start_frame - num_recache_frames
         frames_to_recache = self.full_latents[:, recache_start_frame:current_start_frame].to(self.device)
@@ -717,6 +703,10 @@ class VideoBuilderState:
             )
             
             current_start_frame += current_num_frames
+        
+        # Clean up dummy generation memory
+        del conditional_dict, dummy_noise, denoised_pred
+        torch.cuda.empty_cache()
     
     def _generate_chunk_internal(
         self,
@@ -848,9 +838,7 @@ class VideoBuilderState:
             chunk_idx=chunk_idx,
             user_prompt=user_prompt,
             processed_prompt=processed_prompt,
-            end_latent=end_latent,
-            kv_cache=self._copy_cache(self.pipeline.kv_cache1),
-            crossattn_cache=self._copy_cache(self.pipeline.crossattn_cache),
+            end_latent=end_latent.cpu(),  # Store on CPU to save GPU memory
             current_frame=end_frame
         )
         
@@ -860,6 +848,13 @@ class VideoBuilderState:
         
         # Clean up old states to free GPU memory (keep last 2 for go-back)
         self._cleanup_old_states(keep_last_n=2)
+        
+        # Aggressive memory cleanup after generation
+        del conditional_dict
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        
         self._report_progress("Done!", 1.0)
     
     def _decode_latents_chunked(self, latents, chunk_size=80):
